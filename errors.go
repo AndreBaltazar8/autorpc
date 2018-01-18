@@ -63,46 +63,6 @@ func (e *RemoteFieldTypeError) Error() string {
 	return fmt.Sprintf("autorpc: expected a struct has remote in the Connection API but got %s", e.Type.Kind())
 }
 
-// An TooManyOutputsRemoteError describes a remote function with too many outputs
-type TooManyOutputsRemoteError struct {
-	Function   reflect.StructField
-	NumOutputs int
-}
-
-func (e *TooManyOutputsRemoteError) Error() string {
-	return fmt.Sprintf("autorpc: too many outputs for remote function %s, max num outputs is one of type RemotePromise but got %d", e.Function.Name, e.NumOutputs)
-}
-
-// An NotRemotePromiseError describes a remote function which does not have the output of type RemotePromise
-type NotRemotePromiseError struct {
-	Function reflect.StructField
-	Type     reflect.Type
-}
-
-func (e *NotRemotePromiseError) Error() string {
-	return fmt.Sprintf("autorpc: remote function %s must have RemotePromise has output but has %s", e.Function.Name, e.Type.String())
-}
-
-// An APIFuncTooManyOutputsError describes a connect api function with too many outputs
-type APIFuncTooManyOutputsError struct {
-	Function   reflect.Method
-	NumOutputs int
-}
-
-func (e *APIFuncTooManyOutputsError) Error() string {
-	return fmt.Sprintf("autorpc: too many outputs for connect api function %s, max num outputs is two (data and error) but got %d", e.Function.Name, e.NumOutputs)
-}
-
-// An APIFuncNotErrorOutputError describes a connect api function which does not have the second output of type error
-type APIFuncNotErrorOutputError struct {
-	Function reflect.Method
-	Type     reflect.Type
-}
-
-func (e *APIFuncNotErrorOutputError) Error() string {
-	return fmt.Sprintf("autorpc: remote function %s must have error has the second output but has %s", e.Function.Name, e.Type.String())
-}
-
 // An RPCError describes an error in the RPC service
 type RPCError struct {
 	Err       string
@@ -114,4 +74,14 @@ func (e *RPCError) Error() string {
 		return fmt.Sprintf("autorpc: internal error %s", e.ActualErr)
 	}
 	return fmt.Sprintf("autorpc: %s", e.Err)
+}
+
+// An RemoteFuncError describes an error in the declaration of a remote function
+type RemoteFuncError struct {
+	Err      string
+	Function reflect.StructField
+}
+
+func (e *RemoteFuncError) Error() string {
+	return fmt.Sprintf("autorpc: %s in remote function %s", e.Err, e.Function.Name)
 }

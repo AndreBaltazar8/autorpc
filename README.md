@@ -1,11 +1,11 @@
 # AutoRPC for Go
 Simple RPC library that allows to expose native functions to be called remotely and also allows to call remote functions easily.
 
-# Example of usage
+# Example
 
 ```go
 type Remote struct { // Struct with the remote functions that can be called
-    World func(int) *autorpc.RemotePromise
+    World func(int, func(string, error)) // the second argument here, is a callback to be called when the remote function returns the result
 }
 
 type Local struct { // Struct with local functions that will be exposed as the connection api
@@ -40,18 +40,10 @@ func main() {
     }()
 
     // Call a remote function
-    localAPI.Remote.World(123456).Then(func(result autorpc.RemoteResult, err error) {
+    localAPI.Remote.World(123456, func(str string, err error) {
         // check for function error
         if err != nil {
             fmt.Println("World remote function returned error:", err)
-            return
-        }
-
-        // decode the remote result to a string
-        var str string
-        errDec := result.Decode(&str)
-        if errDec != nil {
-            fmt.Println("Could not decode result: ", err)
             return
         }
 

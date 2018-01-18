@@ -10,56 +10,57 @@ import (
 	"strings"
 )
 
-// A RemoteResult contains the result of a RPC call.
-type RemoteResult json.RawMessage
-
-// Decode transforms the contents of the RemoteResult into the provided interface.
-func (rr *RemoteResult) Decode(v interface{}) error {
-	return json.Unmarshal(*rr, v)
-}
-
 // A RemotePromise holds the promise to be executed when the result of a RPC call is available.
 type RemotePromise struct {
-	handler  *handler
-	r        io.Reader
-	w        io.Writer
-	result   RemoteResult
-	err      error
-	returned bool
-	fns      []func(RemoteResult, error)
+	handler     *handler
+	r           io.Reader
+	w           io.Writer
+	promiseFunc reflect.Value
+	returnTypes []reflect.Type
 }
 
-func newRemotePromise(handler *handler, r io.Reader, w io.Writer) *RemotePromise {
+func newRemotePromise(handler *handler, r io.Reader, w io.Writer, returnTypes []reflect.Type, promiseFunc reflect.Value) *RemotePromise {
 	return &RemotePromise{
-		handler: handler,
-		r:       r,
-		w:       w,
+		handler:     handler,
+		r:           r,
+		w:           w,
+		returnTypes: returnTypes,
+		promiseFunc: promiseFunc,
 	}
 }
 
-func (promise *RemotePromise) resolve(result RemoteResult) {
+func (promise *RemotePromise) resolve(data []json.RawMessage) error {
 	promise.handler.r = promise.r
 	promise.handler.w = promise.w
-	for _, fn := range promise.fns {
-		fn(result, nil)
+
+	numReturns := len(promise.returnTypes)
+	if len(data) != numReturns {
+		return &RPCError{Err: "got wrong num of returns"}
 	}
-	promise.result = result
+
+	returns := make([]reflect.Value, numReturns+1)
+	for j, returnType := range promise.returnTypes {
+		returnValue := reflect.New(returnType)
+		err := json.Unmarshal(data[j], returnValue.Interface())
+		if err != nil {
+			return &RPCError{Err: fmt.Sprintf("error unmarshaling input %d: %s", j, err)}
+		}
+		returns[j] = returnValue.Elem()
+	}
+	returns[numReturns] = reflect.New(reflect.TypeOf((*error)(nil)).Elem()).Elem()
+	promise.promiseFunc.Call(returns)
+	return nil
 }
 
 func (promise *RemotePromise) reject(err error) {
-	for _, fn := range promise.fns {
-		fn(nil, err)
+	numReturns := len(promise.returnTypes)
+	returns := make([]reflect.Value, numReturns+1)
+	for j, returnType := range promise.returnTypes {
+		returnValue := reflect.New(returnType)
+		returns[j] = returnValue.Elem()
 	}
-	promise.err = err
-}
-
-// Then allows to register new callbacks to be executed when the remote result is available.
-func (promise *RemotePromise) Then(fn func(RemoteResult, error)) {
-	if promise.returned {
-		fn(promise.result, promise.err)
-	} else {
-		promise.fns = append(promise.fns, fn)
-	}
+	returns[numReturns] = reflect.ValueOf(err)
+	promise.promiseFunc.Call(returns)
 }
 
 // A Handler executes the RPC calls from the provided reader.
@@ -74,7 +75,7 @@ type Handler interface {
 
 type handler struct {
 	pendingCalls map[int]*RemotePromise
-	fnHandlers   map[string]func([]json.RawMessage) (interface{}, error)
+	fnHandlers   map[string]func([]json.RawMessage) ([]interface{}, error)
 	r            io.Reader
 	w            io.Writer
 	setValue     func(interface{}) error
@@ -87,9 +88,9 @@ type rpcCall struct {
 }
 
 type rpcCallReturn struct {
-	CallID int         `json:"c"`
-	Error  string      `json:"e,omitempty"`
-	Data   interface{} `json:"d,omitempty"`
+	CallID int           `json:"c"`
+	Error  string        `json:"e,omitempty"`
+	Data   []interface{} `json:"d,omitempty"`
 }
 
 type rpcMessage struct {
@@ -97,7 +98,7 @@ type rpcMessage struct {
 	FuncName string            `json:"f,omitempty"`
 	Args     []json.RawMessage `json:"a,omitempty"`
 	Error    string            `json:"e,omitempty"`
-	Data     json.RawMessage   `json:"d,omitempty"`
+	Data     []json.RawMessage `json:"d,omitempty"`
 }
 
 func (msg *rpcMessage) isCall() bool {
@@ -168,18 +169,23 @@ func (handler *handler) Handle() error {
 		}
 
 		writeErr := handler.send(&rpcCallReturn{CallID: msg.CallID, Error: errString, Data: result})
-		if writeErr != nil {
+		if err != nil { // prioritize function error
+			return err
+		} else if writeErr != nil {
 			return &RPCError{ActualErr: writeErr}
 		}
 	} else if msg.isResponse() {
 		promise, exists := handler.pendingCalls[msg.CallID]
 		if exists {
+			delete(handler.pendingCalls, msg.CallID)
 			if msg.Error != "" {
 				promise.reject(errors.New(msg.Error))
 			} else {
-				promise.resolve(RemoteResult(msg.Data))
+				err := promise.resolve(msg.Data)
+				if err != nil {
+					return err
+				}
 			}
-			delete(handler.pendingCalls, msg.CallID)
 		}
 	} else if msg.isRPCError() {
 		promise, exists := handler.pendingCalls[msg.CallID]
@@ -188,6 +194,22 @@ func (handler *handler) Handle() error {
 			delete(handler.pendingCalls, msg.CallID)
 		}
 		return &RPCError{Err: strings.TrimPrefix(msg.Error, "autorpc: ")}
+	}
+
+	return nil
+}
+
+func isPromiseFnType(t reflect.Type, remoteFunc reflect.StructField) error {
+	if t.Kind() != reflect.Func {
+		return &RemoteFuncError{"must have promise function as last argument", remoteFunc}
+	}
+
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	nIn := t.NumIn()
+	if nIn == 0 {
+		return &RemoteFuncError{"promise function must at least one argument of type error", remoteFunc}
+	} else if nIn > 0 && !t.In(nIn-1).AssignableTo(errorType) {
+		return &RemoteFuncError{"promise function must have the last argument of type error", remoteFunc}
 	}
 
 	return nil
@@ -243,11 +265,10 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 
 	handler := handler{
 		pendingCalls: make(map[int]*RemotePromise),
-		fnHandlers:   make(map[string]func([]json.RawMessage) (interface{}, error)),
+		fnHandlers:   make(map[string]func([]json.RawMessage) ([]interface{}, error)),
 		setValue:     setValueFn,
 	}
 
-	remotePromiseType := reflect.TypeOf((*RemotePromise)(nil))
 	if remoteField != -1 {
 		field := re.Field(remoteField)
 		ft := field.Type()
@@ -260,19 +281,32 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 			canSet := field.Field(i).CanSet()
 			if remoteFnField.Type.Kind() == reflect.Func && canSet {
 				fnType := remoteFnField.Type
-				nOut := fnType.NumOut()
-				if nOut > 1 {
-					return nil, &TooManyOutputsRemoteError{remoteFnField, nOut}
-				} else if nOut == 1 && !fnType.Out(0).AssignableTo(remotePromiseType) {
-					return nil, &NotRemotePromiseError{remoteFnField, fnType.Out(0)}
+
+				nIn := fnType.NumIn()
+				if nIn == 0 {
+					return nil, &RemoteFuncError{"must have a promise function as last argument", remoteFnField}
+				} else if nIn > 0 {
+					err := isPromiseFnType(fnType.In(nIn-1), remoteFnField)
+					if err != nil {
+						return nil, err
+					}
 				}
+
+				promiseFnType := fnType.In(nIn - 1)
+				numReturns := promiseFnType.NumIn() - 1
+				returnTypes := make([]reflect.Type, numReturns)
+				for j := 0; j < numReturns; j++ {
+					returnTypes[j] = promiseFnType.In(j)
+				}
+
 				fnName := remoteFnField.Name
 
 				field.Field(i).Set(reflect.MakeFunc(fnType, func(args []reflect.Value) []reflect.Value {
-					r := newRemotePromise(&handler, handler.r, handler.w)
+					nArgs := len(args) - 1
+					r := newRemotePromise(&handler, handler.r, handler.w, returnTypes, args[nArgs])
 					var argVals []json.RawMessage
-					for _, arg := range args {
-						b, err := json.Marshal(arg.Interface())
+					for j := 0; j < nArgs; j++ {
+						b, err := json.Marshal(args[j].Interface())
 						if err != nil {
 							r.reject(err)
 							return []reflect.Value{reflect.ValueOf(r)}
@@ -295,7 +329,7 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 						return []reflect.Value{reflect.ValueOf(r)}
 					}
 
-					return []reflect.Value{reflect.ValueOf(r)}
+					return []reflect.Value{}
 				}))
 			}
 		}
@@ -309,18 +343,17 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 		nOut := mtype.NumOut()
 		methodValue := rv.Method(i)
 
-		if nOut > 2 {
-			return nil, &APIFuncTooManyOutputsError{method, nOut}
-		} else if nOut == 2 && !mtype.Out(1).AssignableTo(errorType) { // second output must be of type error
-			return nil, &APIFuncNotErrorOutputError{method, mtype.Out(1)}
+		isLastArgError := false
+		if nOut > 0 && mtype.Out(nOut-1).AssignableTo(errorType) {
+			isLastArgError = true
 		}
 
 		nInEffective := mtype.NumIn() - 1
 
 		fnName := method.Name
-		handler.fnHandlers[fnName] = func(args []json.RawMessage) (interface{}, error) {
+		handler.fnHandlers[fnName] = func(args []json.RawMessage) ([]interface{}, error) {
 			if len(args) != nInEffective {
-				return json.RawMessage{}, &RPCError{"internal error", errors.New("method input length does not match")}
+				return nil, &RPCError{"internal error", errors.New("method input length does not match")}
 			}
 
 			in := make([]reflect.Value, nInEffective)
@@ -335,22 +368,25 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 			}
 
 			out := methodValue.Call(in)
-			if len(out) == 2 {
-				val := out[0].Interface()
-				errOut := out[1].Interface()
+
+			if isLastArgError {
+				outVals := make([]interface{}, len(out)-1)
+				for j := 0; j < len(out)-1; j++ {
+					outVals[j] = out[j].Interface()
+				}
+
+				errOut := out[len(out)-1].Interface()
 				if err, ok := errOut.(error); ok || errOut == nil {
-					return val, err
+					return outVals, err
 				}
-				// should never happen..
-				panic(fmt.Sprintf("IMPLEMENTATION ERROR - Method %s second output must be of type error", fnName))
-			} else if len(out) == 1 {
-				val := out[0].Interface()
-				if err, ok := val.(error); ok {
-					return nil, err
+				panic(fmt.Sprintf("last return is not of type error in function %s, got %s", fnName, out[len(out)-1].Type()))
+			} else {
+				outVals := make([]interface{}, len(out))
+				for j := 0; j < len(out); j++ {
+					outVals[j] = out[j].Interface()
 				}
-				return val, nil
+				return outVals, nil
 			}
-			return nil, nil
 		}
 
 	}
