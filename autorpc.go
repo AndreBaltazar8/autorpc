@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 // A RemotePromise holds the promise to be executed when the result of a RPC call is available.
@@ -74,10 +75,11 @@ type Handler interface {
 }
 
 type handler struct {
-	pendingCalls map[int]*RemotePromise
+	pendingCalls sync.Map
 	fnHandlers   map[string]func([]json.RawMessage) ([]interface{}, error)
 	r            io.Reader
 	w            io.Writer
+	decoder      *json.Decoder
 	setValue     func(interface{}) error
 }
 
@@ -113,12 +115,22 @@ func (msg *rpcMessage) isRPCError() bool {
 	return strings.HasPrefix(msg.Error, "autorpc:")
 }
 
+func (handler *handler) getPendingCall(callID int) (*RemotePromise, bool) {
+	val, ok := handler.pendingCalls.Load(callID)
+	if !ok {
+		return nil, false
+	}
+	if v, ok := val.(*RemotePromise); ok {
+		return v, true
+	}
+	panic("stored pending call has wrong type")
+}
+
 func (handler *handler) newCall(promise *RemotePromise) int {
 	var callID int
 	for {
 		callID = rand.Int()
-		if _, exists := handler.pendingCalls[callID]; !exists {
-			handler.pendingCalls[callID] = promise
+		if _, exists := handler.pendingCalls.LoadOrStore(callID, promise); !exists {
 			return callID
 		}
 	}
@@ -136,14 +148,14 @@ func (handler *handler) SetValue(v interface{}) error {
 // SetRW sets the reader and writer for the RPC.
 func (handler *handler) SetRW(r io.Reader, w io.Writer) {
 	handler.r = r
+	handler.decoder = json.NewDecoder(handler.r)
 	handler.w = w
 }
 
 // Handle reads the RPC calls, executes them and then writes the result.
 func (handler *handler) Handle() error {
-	decoder := json.NewDecoder(handler.r)
 	msg := rpcMessage{}
-	err := decoder.Decode(&msg)
+	err := handler.decoder.Decode(&msg)
 	if err != nil {
 		if err == io.EOF {
 			return err
@@ -175,9 +187,9 @@ func (handler *handler) Handle() error {
 			return &RPCError{ActualErr: writeErr}
 		}
 	} else if msg.isResponse() {
-		promise, exists := handler.pendingCalls[msg.CallID]
+		promise, exists := handler.getPendingCall(msg.CallID)
 		if exists {
-			delete(handler.pendingCalls, msg.CallID)
+			handler.pendingCalls.Delete(msg.CallID)
 			if msg.Error != "" {
 				promise.reject(errors.New(msg.Error))
 			} else {
@@ -188,10 +200,10 @@ func (handler *handler) Handle() error {
 			}
 		}
 	} else if msg.isRPCError() {
-		promise, exists := handler.pendingCalls[msg.CallID]
+		promise, exists := handler.getPendingCall(msg.CallID)
 		if exists {
 			promise.reject(errors.New(msg.Error))
-			delete(handler.pendingCalls, msg.CallID)
+			handler.pendingCalls.Delete(msg.CallID)
 		}
 		return &RPCError{Err: strings.TrimPrefix(msg.Error, "autorpc: ")}
 	}
@@ -225,6 +237,9 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 	var valueField, remoteField int = -1, -1
 	re := rv.Elem()
 	rt := re.Type()
+	if rt.Kind() != reflect.Struct {
+		return nil, &InvalidConnectionAPIError{reflect.TypeOf(connAPI)}
+	}
 	for i := 0; i < rt.NumField(); i++ {
 		field := rt.Field(i)
 		tag := field.Tag.Get("autorpc")
@@ -264,9 +279,8 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 	}
 
 	handler := handler{
-		pendingCalls: make(map[int]*RemotePromise),
-		fnHandlers:   make(map[string]func([]json.RawMessage) ([]interface{}, error)),
-		setValue:     setValueFn,
+		fnHandlers: make(map[string]func([]json.RawMessage) ([]interface{}, error)),
+		setValue:   setValueFn,
 	}
 
 	if remoteField != -1 {
@@ -309,7 +323,7 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 						b, err := json.Marshal(args[j].Interface())
 						if err != nil {
 							r.reject(err)
-							return []reflect.Value{reflect.ValueOf(r)}
+							return []reflect.Value{}
 						}
 
 						argVals = append(argVals, b)
@@ -324,9 +338,9 @@ func CreateHandler(connAPI interface{}) (Handler, error) {
 
 					err := json.NewEncoder(r.w).Encode(call)
 					if err != nil {
-						delete(handler.pendingCalls, callID)
+						handler.pendingCalls.Delete(callID)
 						r.reject(err)
-						return []reflect.Value{reflect.ValueOf(r)}
+						return []reflect.Value{}
 					}
 
 					return []reflect.Value{}
