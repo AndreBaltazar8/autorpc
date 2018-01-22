@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -84,19 +85,19 @@ type handler struct {
 }
 
 type rpcCall struct {
-	CallID   int               `json:"c"`
+	CallID   string            `json:"c"`
 	Args     []json.RawMessage `json:"a"`
 	FuncName string            `json:"f"`
 }
 
 type rpcCallReturn struct {
-	CallID int           `json:"c"`
+	CallID string        `json:"c"`
 	Error  string        `json:"e,omitempty"`
 	Data   []interface{} `json:"d,omitempty"`
 }
 
 type rpcMessage struct {
-	CallID   int               `json:"c"`
+	CallID   string            `json:"c"`
 	FuncName string            `json:"f,omitempty"`
 	Args     []json.RawMessage `json:"a,omitempty"`
 	Error    string            `json:"e,omitempty"`
@@ -115,7 +116,7 @@ func (msg *rpcMessage) isRPCError() bool {
 	return strings.HasPrefix(msg.Error, "autorpc:")
 }
 
-func (handler *handler) getPendingCall(callID int) (*RemotePromise, bool) {
+func (handler *handler) getPendingCall(callID string) (*RemotePromise, bool) {
 	val, ok := handler.pendingCalls.Load(callID)
 	if !ok {
 		return nil, false
@@ -126,12 +127,12 @@ func (handler *handler) getPendingCall(callID int) (*RemotePromise, bool) {
 	panic("stored pending call has wrong type")
 }
 
-func (handler *handler) newCall(promise *RemotePromise) int {
+func (handler *handler) newCall(promise *RemotePromise) string {
 	var callID int
 	for {
 		callID = rand.Int()
-		if _, exists := handler.pendingCalls.LoadOrStore(callID, promise); !exists {
-			return callID
+		if _, exists := handler.pendingCalls.LoadOrStore(strconv.Itoa(callID), promise); !exists {
+			return strconv.Itoa(callID)
 		}
 	}
 }
