@@ -300,7 +300,7 @@ func (service *service) handle(conn net.Conn, connection Connection) error {
 		}
 
 		writeErr := service.send(conn, &rpcCallReturn{CallID: msg.CallID, Error: errString, Data: result})
-		if err != nil { // prioritize function error
+		if _, rpcErr := err.(*RPCError); err != nil && rpcErr { // prioritize function error
 			return err
 		} else if writeErr != nil {
 			return &RPCError{ActualErr: writeErr}
